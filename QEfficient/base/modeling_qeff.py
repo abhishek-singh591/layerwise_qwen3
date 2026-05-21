@@ -309,8 +309,8 @@ class QEFFBaseModel(ABC):
         output_name = []
         output_name.append("logits")
         for layer_idx in range(idx, end_idx):
-            output_name.append(f"compressed_kv.{layer_idx}_InternalRetainedState")
-            output_name.append(f"k_pe.{layer_idx}_InternalRetainedState")
+            output_name.append(f"past_key.{layer_idx}_InternalRetainedState")
+            output_name.append(f"past_value.{layer_idx}_InternalRetainedState")
 
         if idx >= 1:
             z = example_inputs.pop("input_ids")

@@ -146,6 +146,7 @@ window_size = 1
 total_layers = 2 # resolved_total_layers # config.num_hidden_layers = 1
 windows = _build_layer_windows(total_layers=total_layers, window_size=window_size)
 qeff_model = None
+first_onnx_path=None
 for start, end in windows:
     transformers.modeling_utils.PreTrainedModel._start = start
     transformers.modeling_utils.PreTrainedModel._end = end
@@ -184,7 +185,7 @@ for start, end in windows:
         use_onnx_subfunctions=True,
     )
     if first_onnx_path is None:
-            first_onnx_path = Path(onnx_path)
+        first_onnx_path = Path(onnx_path)
 
     if first_onnx_path is None:
         raise RuntimeError("No ONNX path produced during compilation.")
