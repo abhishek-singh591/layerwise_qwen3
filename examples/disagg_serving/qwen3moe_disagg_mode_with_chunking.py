@@ -5,6 +5,7 @@
 #
 # -----------------------------------------------------------------------------
 
+import functools
 import time
 
 import numpy as np
@@ -14,8 +15,8 @@ from transformers import AutoConfig, AutoTokenizer
 from QEfficient import QEFFAutoModelForCausalLM
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 
-# model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507"  # weights are not required to convert to fp32
-model_id = "yujiepan/qwen3-moe-tiny-random"
+model_id = "Qwen/Qwen3-235B-A22B-Instruct-2507"  # weights are not required to convert to fp32
+# model_id = "yujiepan/qwen3-moe-tiny-random"
 prompt = """
 Explain quantum computing in simple terms.
 """
@@ -23,41 +24,169 @@ config = AutoConfig.from_pretrained(model_id)
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 PREFILL_SEQ_LEN = 256
 CTX_LEN = PREFILL_SEQ_LEN * 3
+import transformers
+import QEfficient
 
-qeff_model = QEFFAutoModelForCausalLM.from_pretrained(model_id)
-decode_qpc_path = qeff_model.compile(
-    prefill_seq_len=1,
-    ctx_len=CTX_LEN,
-    num_cores=16,
-    mxfp6_matmul=True,
-    mxint8_kv_cache=True,
-    num_devices=1,
-    mos=1,
-    aic_enable_depth_first=True,
-    num_speculative_tokens=None,
-    offload_pt_weights=False,  # Need the weights in memory for prefill-model export/compilation in the next step
-    retain_full_kv=True,
-)
+def _ensure_pretrained_window_attrs():
+    if not hasattr(transformers.modeling_utils.PreTrainedModel, "_start"):
+        transformers.modeling_utils.PreTrainedModel._start = 0
+    if not hasattr(transformers.modeling_utils.PreTrainedModel, "_end"):
+        transformers.modeling_utils.PreTrainedModel._end = 0
+        
+def _build_layer_windows(total_layers: int, window_size: int):
+    if total_layers <= 0:
+        raise ValueError(f"Invalid total_layers={total_layers}. Expected: total_layers > 0.")
+    if window_size <= 0:
+        raise ValueError(f"Invalid window_size={window_size}. Expected: window_size > 0.")
 
-# Following command errors out by default, the user is supposed to run the printed command and provide the generated qpc path as prefill_qpc_path commenting out lines 55-68
+    windows = []
+    end = total_layers
+    while end > 0:
+        start = max(0, end - window_size)
+        windows.append((start, end))
+        end = start
 
-# prefill_qpc_path = ""
+    return windows
 
-prefill_qpc_path = qeff_model.compile(
-    prefill_seq_len=PREFILL_SEQ_LEN,
-    ctx_len=CTX_LEN,
-    num_cores=16,
-    mxfp6_matmul=True,
-    mxint8_kv_cache=True,
-    num_devices=1,
-    split_retained_state_io=True,
-    mos=1,
-    aic_enable_depth_first=True,
-    num_speculative_tokens=None,
-    prefill_only=True,
-    enable_chunking=True,
-    # use_onnx_subfunctions=True,
-)
+
+def _null_outside_window_layers(model):
+    start = int(getattr(transformers.modeling_utils.PreTrainedModel, "_start", 0))
+    end = int(getattr(transformers.modeling_utils.PreTrainedModel, "_end", 0))
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None:
+        return
+    for idx, _ in enumerate(layers):
+        if idx < start or idx >= end:
+            layers[idx] = None
+
+
+def _install_window_patch(model_cls):
+    if getattr(model_cls, "_window_patch_installed", False):
+        return
+
+    original_init = model_cls.__init__
+
+    @functools.wraps(original_init)
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _null_outside_window_layers(self)
+
+    model_cls.__init__ = patched_init
+    model_cls._window_patch_installed = True
+
+
+def _install_shard_window_patch():
+    if getattr(transformers.modeling_utils, "_window_shard_patch_installed", False):
+        return
+
+    original_get_checkpoint_shard_files = transformers.modeling_utils.get_checkpoint_shard_files
+
+    @functools.wraps(original_get_checkpoint_shard_files)
+    def patched_get_checkpoint_shard_files(*args, **kwargs):
+        shard_files, metadata = original_get_checkpoint_shard_files(*args, **kwargs)
+        weight_map = metadata.get("weight_map")
+        if not weight_map:
+            return shard_files, metadata
+
+        start = int(getattr(transformers.modeling_utils.PreTrainedModel, "_start", 0))
+        end = int(getattr(transformers.modeling_utils.PreTrainedModel, "_end", 0))
+        if end <= start:
+            return shard_files, metadata
+
+        selected_prefixes = tuple(f"model.layers.{layer_idx}." for layer_idx in range(start, end))
+        filtered_weight_map = {}
+        for checkpoint_key, shard_name in weight_map.items():
+            if checkpoint_key.startswith("model.layers."):
+                if checkpoint_key.startswith(selected_prefixes):
+                    filtered_weight_map[checkpoint_key] = shard_name
+                continue
+            filtered_weight_map[checkpoint_key] = shard_name
+
+        if not filtered_weight_map:
+            return shard_files, metadata
+
+        shard_name_to_path = {path.split("/")[-1]: path for path in shard_files}
+        filtered_shard_names = sorted(set(filtered_weight_map.values()))
+        filtered_shard_files = [shard_name_to_path[name] for name in filtered_shard_names if name in shard_name_to_path]
+        if not filtered_shard_files:
+            return shard_files, metadata
+
+        metadata["weight_map"] = filtered_weight_map
+        metadata["all_checkpoint_keys"] = list(filtered_weight_map.keys())
+        return filtered_shard_files, metadata
+
+    transformers.modeling_utils.get_checkpoint_shard_files = patched_get_checkpoint_shard_files
+    transformers.modeling_utils._window_shard_patch_installed = True
+
+
+_ensure_pretrained_window_attrs()
+_install_shard_window_patch()
+text_config = getattr(config, "text_config", config)
+resolved_total_layers = getattr(text_config, "num_hidden_layers", None)
+if resolved_total_layers is None:
+    raise ValueError("Could not resolve `num_hidden_layers` from config.")
+
+# Layerwise window size. `1` keeps only one decoder layer active per window.
+window_size = 1
+total_layers = 3 # resolved_total_layers
+windows = _build_layer_windows(total_layers=total_layers, window_size=window_size)
+qeff_model = None
+for start, end in windows:
+    transformers.modeling_utils.PreTrainedModel._start = start
+    transformers.modeling_utils.PreTrainedModel._end = end
+    transformers.modeling_utils.PreTrainedModel._total_layers = total_layers
+    QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe.QEffQwen3MoeModel._start = start
+    QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe.QEffQwen3MoeModel._end = end
+    QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe.QEffQwen3MoeModel._total_layers = total_layers
+    QEfficient.base.modeling_qeff.QEFFBaseModel._start = start
+    QEfficient.base.modeling_qeff.QEFFBaseModel._end = end
+    QEfficient.base.modeling_qeff.QEFFBaseModel._total_layers = total_layers
+    _install_window_patch(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeForCausalLM)
+    qeff_model = QEFFAutoModelForCausalLM.from_pretrained(model_id)
+    if hasattr(qeff_model, "model"):
+        _null_outside_window_layers(qeff_model.model)
+    if hasattr(qeff_model, "model") and hasattr(qeff_model.model, "config"):
+        qeff_model.model.config.num_hidden_layers = total_layers
+    if hasattr(qeff_model, "config"):
+        qeff_model.config.num_hidden_layers = total_layers
+    
+    import pdb; pdb.set_trace()
+    decode_qpc_path = qeff_model.compile(
+        prefill_seq_len=1,
+        ctx_len=CTX_LEN,
+        num_cores=16,
+        mxfp6_matmul=True,
+        mxint8_kv_cache=True,
+        num_devices=1,
+        mos=1,
+        aic_enable_depth_first=True,
+        num_speculative_tokens=None,
+        offload_pt_weights=False,  # Need the weights in memory for prefill-model export/compilation in the next step
+        retain_full_kv=True,
+    )
+
+    # Following command errors out by default, the user is supposed to run the printed command and provide the generated qpc path as prefill_qpc_path commenting out lines 55-68
+
+    # prefill_qpc_path = ""
+
+    prefill_qpc_path = qeff_model.compile(
+        prefill_seq_len=PREFILL_SEQ_LEN,
+        ctx_len=CTX_LEN,
+        num_cores=16,
+        mxfp6_matmul=True,
+        mxint8_kv_cache=True,
+        num_devices=1,
+        split_retained_state_io=True,
+        mos=1,
+        aic_enable_depth_first=True,
+        num_speculative_tokens=None,
+        prefill_only=True,
+        enable_chunking=True,
+        # use_onnx_subfunctions=True,
+    )
+
+if qeff_model is None:
+    raise RuntimeError("Failed to initialize QEfficient model.")
 
 
 inputs = tokenizer(prompt, return_tensors="np", padding=True)

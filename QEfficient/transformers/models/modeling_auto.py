@@ -3170,7 +3170,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 else pkv_dynamic_axes
             )
             pkv_dynamic_axes = (
-                [pkv_dynamic_axes] * self.model.config.num_hidden_layers
+                [pkv_dynamic_axes] * self.num_layers
                 if isinstance(pkv_dynamic_axes, dict)
                 else pkv_dynamic_axes
             )
