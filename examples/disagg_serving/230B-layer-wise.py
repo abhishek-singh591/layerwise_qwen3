@@ -14,6 +14,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from QEfficient import QEFFAutoModelForCausalLM
 from QEfficient.generation.cloud_infer import QAICInferenceSession
+from pathlib import Path
 
 model_id = "Qwen/Qwen3-235B-A22B-Instruct-2507"  # weights are not required to convert to fp32
 # model_id = "yujiepan/qwen3-moe-tiny-random"
@@ -27,8 +28,8 @@ config = AutoConfig.from_pretrained(model_id)
 config.torch_dtype = torch.float16
 torch_dtype = torch.float16
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-PREFILL_SEQ_LEN = 512
-CTX_LEN = PREFILL_SEQ_LEN * 3
+PREFILL_SEQ_LEN = 32
+CTX_LEN = 128
 
 
 
@@ -82,6 +83,12 @@ def _install_window_patch(model_cls):
     model_cls.__init__ = patched_init
     model_cls._window_patch_installed = True
 
+def _resolve_export_root(onnx_path: Path) -> Path:
+    parts = list(onnx_path.parts)
+    if "onnx_layerwise_tmp" in parts:
+        marker_idx = parts.index("onnx_layerwise_tmp")
+        return Path(*parts[:marker_idx])
+    return onnx_path.parent
 
 def _install_shard_window_patch():
     if getattr(transformers.modeling_utils, "_window_shard_patch_installed", False):
@@ -153,19 +160,15 @@ for start, end in windows:
     qeff_model = QEFFAutoModelForCausalLM.from_pretrained(model_id, config=config, torch_dtype=torch.float16)
     if hasattr(qeff_model, "model"):
         _null_outside_window_layers(qeff_model.model)
-    if hasattr(qeff_model, "model") and hasattr(qeff_model.model, "config"):
-        qeff_model.model.config.num_hidden_layers = total_layers
-    if hasattr(qeff_model, "config"):
-        qeff_model.config.num_hidden_layers = total_layers
     
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
 
 
     # Following command errors out by default, the user is supposed to run the printed command and provide the generated qpc path as prefill_qpc_path commenting out lines 55-68
 
     # prefill_qpc_path = ""
 
-    prefill_qpc_path = qeff_model.compile(
+    onnx_path = qeff_model.compile(
         prefill_seq_len=PREFILL_SEQ_LEN,
         ctx_len=CTX_LEN,
         num_cores=16,
@@ -180,6 +183,13 @@ for start, end in windows:
         enable_chunking=True,
         use_onnx_subfunctions=True,
     )
+    if first_onnx_path is None:
+            first_onnx_path = Path(onnx_path)
+
+    if first_onnx_path is None:
+        raise RuntimeError("No ONNX path produced during compilation.")
+    export_root = _resolve_export_root(first_onnx_path)
+    final_onnx_path = QEfficient.utils.layerwise_pipeline(str(export_root))
 
 # if qeff_model is None:
 #     raise RuntimeError("Failed to initialize QEfficient model.")

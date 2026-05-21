@@ -330,6 +330,11 @@ class QEFFBaseModel(ABC):
             example_inputs["compressed_kvs"] = [
                 val for i, val in enumerate(example_inputs["compressed_kvs"]) if i < window_size
             ]
+            
+        if "past_key_values" in example_inputs:
+            example_inputs["past_key_values"] = [
+                val for i, val in enumerate(example_inputs["past_key_values"]) if i < window_size
+            ]
 
         # Create input_names from example_inputs
         input_names = []
@@ -337,10 +342,12 @@ class QEFFBaseModel(ABC):
             if param in example_inputs:
                 if param == "past_key_values":
                     for i in range(len(example_inputs["past_key_values"])):
-                        # example_inputs["past_key_values"] = [
-                        #     val for i, val in enumerate(example_inputs["past_key_values"]) if i < window_size]
+                        example_inputs["past_key_values"] = [
+                            val for i, val in enumerate(example_inputs["past_key_values"]) if i < window_size]
                         if len(example_inputs["past_key_values"][0]) == 2:
-                            input_names.extend([f"past_key.{i}", f"past_value.{i}"])
+                            for layer_offset in range(len(example_inputs["past_key_values"])):
+                                layer_idx = idx + layer_offset
+                                input_names.extend([f"past_key.{layer_idx}", f"past_value.{layer_idx}"])
                         elif len(example_inputs["past_key_values"][0]) == 4:
                             input_names.extend(
                                 [

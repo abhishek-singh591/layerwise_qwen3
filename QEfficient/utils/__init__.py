@@ -42,3 +42,6 @@ from QEfficient.utils.hash_utils import (  # noqa: F401
     create_export_hash,
     hash_dict_params,
 )
+from QEfficient.utils.layerwise_pipeline import (  # noqa: F401
+    layerwise_pipeline,
+)
