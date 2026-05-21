@@ -156,6 +156,12 @@ def _cumsum_scatter_gather_update_expert_blocked(
     """
     batch_size, seq_len = T2Ei.shape
     packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
+    num_q_ffn_blocks = 2
+    if num_q_ffn_blocks is not None:
+        assert seq_len % num_q_ffn_blocks == 0, "Something went wrong"
+        packed_chunk_size = seq_len // num_q_ffn_blocks
+    else:
+        num_q_ffn_blocks = seq_len // packed_chunk_size
 
     matched_idx = _build_matched_idx_from_cumsum(T2Ei)
     valid_rows = torch.einsum("ij->i", T2Ei.to(torch.int32)).unsqueeze(1)
@@ -163,9 +169,14 @@ def _cumsum_scatter_gather_update_expert_blocked(
     x_expanded = x.unsqueeze(0).expand(batch_size, -1, -1)
     rw_expanded = routing_weight.unsqueeze(-1)
 
-    for packed_start in range(0, seq_len, packed_chunk_size):
-        packed_stop = packed_start + packed_chunk_size
+    for chunk_idx in range(num_q_ffn_blocks):
+        packed_start = chunk_idx * packed_chunk_size
+        if chunk_idx == num_q_ffn_blocks - 1:
+            packed_stop = seq_len
+        else:
+            packed_stop = packed_start + packed_chunk_size
         chunk_matched_idx = matched_idx[:, packed_start:packed_stop]
+        print(f"chunk_idx {chunk_idx}; packed_start {packed_start}, packed_stop {packed_stop}")
 
         x_chunk = CtxGatherFunc3DGeneralized.apply(x_expanded, chunk_matched_idx)
 
@@ -238,6 +249,40 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             )
         return torch.einsum("ijk->jk", expert_out)
 
+    def _forward_expert_blocked_export_safe(self, x: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
+        """ONNX-export-safe blocked path that avoids tracing mega all-expert stacked constants."""
+        T, H = x.shape
+        num_nsp = EXPERT_BLOCKING_NUM_NSP
+        if self.num_experts % num_nsp != 0:
+            raise ValueError(
+                f"num_experts ({self.num_experts}) must be divisible by EXPERT_BLOCKING_NUM_NSP ({num_nsp})"
+            )
+        local_experts = self.num_experts // num_nsp
+        rw = routing_weights.transpose(0, 1).contiguous().view(local_experts, num_nsp, T).transpose(0, 1).contiguous()
+        expert_out = x.new_zeros((num_nsp, T, H))
+        for slot in range(local_experts):
+            print(f">>>>> slot {slot}")
+            slot_start = slot * num_nsp
+            slot_experts = self.experts[slot_start : slot_start + num_nsp]
+            W_g = torch.stack([expert.gate_proj.weight.T for expert in slot_experts], dim=0)
+            W_u = torch.stack([expert.up_proj.weight.T for expert in slot_experts], dim=0)
+            W_d = torch.stack([expert.down_proj.weight.T for expert in slot_experts], dim=0)
+            routing_weight = rw[:, slot, :]
+            T2Ei = routing_weight > 0
+            expert_out = _cumsum_scatter_gather_update_expert_blocked(
+                x=x,
+                T2Ei=T2Ei,
+                W_g=W_g,
+                W_u=W_u,
+                W_d=W_d,
+                routing_weight=routing_weight,
+                expert_out=expert_out,
+                act_fn=self.experts[0].act_fn,
+                T=T,
+                packed_chunk_size=EXPERT_BLOCKING_PACKED_CHUNK_SIZE,
+            )
+        return expert_out.sum(dim=0)
+
     def orig_forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, S, H = hidden_states.shape
         T = B * S
@@ -276,7 +321,7 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         routing_weights.scatter_(1, top_i, top_w)
 
         if self.num_experts % EXPERT_BLOCKING_NUM_NSP == 0:
-            expert_out = self._forward_expert_blocked(x=x, routing_weights=routing_weights)
+            expert_out = self._forward_expert_blocked_export_safe(x=x, routing_weights=routing_weights) # self._forward_expert_blocked
             return expert_out.view(B, S, H), router_logits
 
         expert_out = x.new_zeros((T, H))
@@ -432,7 +477,7 @@ class QEffQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         """
 
         residual = hidden_states
-        
+
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -467,7 +512,6 @@ class QEffQwen3MoeModel(Qwen3MoeModel):
     _start=0
     _end=0
     _total_layers = None
-    
     def __qeff_init__(self):
         self.rotary_emb = QEffQwen3MoeRotaryEmbedding(config=self.config)
         self.sin_cached = torch.nn.Parameter(self.rotary_emb.sin_cached)
@@ -497,13 +541,13 @@ class QEffQwen3MoeModel(Qwen3MoeModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
+    
         start = QEffQwen3MoeModel._start
         end = QEffQwen3MoeModel._end
         ctx_len = past_key_values[start%1][0].shape[2]
         # past_key_values_length = 0
         # if past_key_values is not None:
-        #     past_key_values_length = past_key_values[start%1][0].shape[2]
+        #     past_key_values_length = past_key_values[0][0].shape[2]
 
         past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
 
@@ -520,6 +564,7 @@ class QEffQwen3MoeModel(Qwen3MoeModel):
         cos = self.cos_cached[position_ids].unsqueeze(1)
 
         for layer_idx, decoder_layer in enumerate(self.layers):
+            print(f">>>>>>>>>>>>>>> layer_idx : {layer_idx}")
             if layer_idx < start or layer_idx >= end:
                 continue
             if layer_indices_to_run is not None and layer_idx not in layer_indices_to_run:
