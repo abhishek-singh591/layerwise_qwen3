@@ -314,16 +314,9 @@ class QEFFBaseModel(ABC):
 
         if idx >= 1:
             z = example_inputs.pop("input_ids")
-            # z = example_inputs["input_ids"]
-            ################### model_dependent ############################
-            inputs_embeds = torch.rand(z.shape[0], z.shape[1], 4096, device=z.device, dtype=torch.float16)
-            # example_inputs[f"layer_{QEFFBaseModel._start}/inputs_embeds"] = inputs_embeds
-            # dynamic_axes[f"layer_{QEFFBaseModel._start}/inputs_embeds"] = dynamic_axes.pop("input_ids")
+            inputs_embeds = torch.rand(z.shape[0], z.shape[1], self.model.config.hidden_size, device=z.device, dtype=torch.float16)
             example_inputs["inputs_embeds"] = inputs_embeds
             dynamic_axes["inputs_embeds"] = dynamic_axes.pop("input_ids")
-        # Create input_names from example_inputs
-        # example_inputs[f"layer_{QEFFBaseModel._start}/position_ids"] = example_inputs.pop("position_ids")
-        # dynamic_axes[f"layer_{QEFFBaseModel._start}/position_ids"] = dynamic_axes.pop("position_ids")
 
         window_size = end_idx - idx
         if "compressed_kvs" in example_inputs:
