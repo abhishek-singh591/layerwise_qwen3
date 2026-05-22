@@ -544,17 +544,17 @@ class QEffQwen3MoeModel(Qwen3MoeModel):
     
         start = QEffQwen3MoeModel._start
         end = QEffQwen3MoeModel._end
-        ctx_len = past_key_values[start%1][0].shape[2]
-        # past_key_values_length = 0
-        # if past_key_values is not None:
-        #     past_key_values_length = past_key_values[0][0].shape[2]
+        # ctx_len = past_key_values[start%1][0].shape[2]
+        past_key_values_length = 0
+        if past_key_values is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
 
         past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = _create_causal_mask(position_ids=position_ids, target_length=ctx_len)
+        causal_mask = _create_causal_mask(position_ids=position_ids, target_length=past_key_values_length)
 
         hidden_states = inputs_embeds
 

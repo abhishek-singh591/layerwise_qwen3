@@ -315,8 +315,7 @@ class QEFFBaseModel(ABC):
         if idx >= 1:
             z = example_inputs.pop("input_ids")
             # z = example_inputs["input_ids"]
-            ################### model_dependent ############################
-            inputs_embeds = torch.rand(z.shape[0], z.shape[1], 4096, device=z.device, dtype=torch.float16)
+            inputs_embeds = torch.rand(z.shape[0], z.shape[1], self.model.config.hidden_size, device=z.device, dtype=torch.float16)
             # example_inputs[f"layer_{QEFFBaseModel._start}/inputs_embeds"] = inputs_embeds
             # dynamic_axes[f"layer_{QEFFBaseModel._start}/inputs_embeds"] = dynamic_axes.pop("input_ids")
             example_inputs["inputs_embeds"] = inputs_embeds

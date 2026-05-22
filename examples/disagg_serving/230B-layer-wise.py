@@ -28,7 +28,7 @@ config = AutoConfig.from_pretrained(model_id)
 config.torch_dtype = torch.float16
 torch_dtype = torch.float16
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-PREFILL_SEQ_LEN = 32
+PREFILL_SEQ_LEN = 2
 CTX_LEN = 128
 
 
@@ -187,10 +187,10 @@ for start, end in windows:
     if first_onnx_path is None:
         first_onnx_path = Path(onnx_path)
 
-    if first_onnx_path is None:
-        raise RuntimeError("No ONNX path produced during compilation.")
-    export_root = _resolve_export_root(first_onnx_path)
-    final_onnx_path = QEfficient.utils.layerwise_pipeline(str(export_root))
+if first_onnx_path is None:
+    raise RuntimeError("No ONNX path produced during compilation.")
+export_root = _resolve_export_root(first_onnx_path)
+final_onnx_path = QEfficient.utils.layerwise_pipeline(str(export_root))
 
 # if qeff_model is None:
 #     raise RuntimeError("Failed to initialize QEfficient model.")
