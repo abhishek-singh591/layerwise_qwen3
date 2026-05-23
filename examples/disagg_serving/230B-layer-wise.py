@@ -15,6 +15,7 @@ from transformers import AutoConfig, AutoTokenizer
 from QEfficient import QEFFAutoModelForCausalLM
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 from pathlib import Path
+import time
 
 model_id = "Qwen/Qwen3-235B-A22B-Instruct-2507"  # weights are not required to convert to fp32
 # model_id = "yujiepan/qwen3-moe-tiny-random"
@@ -28,7 +29,7 @@ config = AutoConfig.from_pretrained(model_id)
 config.torch_dtype = torch.float16
 torch_dtype = torch.float16
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-PREFILL_SEQ_LEN = 2
+PREFILL_SEQ_LEN = 4
 CTX_LEN = 128
 
 
@@ -41,7 +42,7 @@ def _ensure_pretrained_window_attrs():
         transformers.modeling_utils.PreTrainedModel._start = 0
     if not hasattr(transformers.modeling_utils.PreTrainedModel, "_end"):
         transformers.modeling_utils.PreTrainedModel._end = 0
-        
+
 def _build_layer_windows(total_layers: int, window_size: int):
     if total_layers <= 0:
         raise ValueError(f"Invalid total_layers={total_layers}. Expected: total_layers > 0.")
@@ -143,10 +144,11 @@ if resolved_total_layers is None:
 
 # Layerwise window size. `1` keeps only one decoder layer active per window.
 window_size = 1
-total_layers = 2 # resolved_total_layers # config.num_hidden_layers = 1
+total_layers = resolved_total_layers # config.num_hidden_layers = 1
 windows = _build_layer_windows(total_layers=total_layers, window_size=window_size)
 qeff_model = None
 first_onnx_path=None
+export_start = time.perf_counter()
 for start, end in windows:
     transformers.modeling_utils.PreTrainedModel._start = start
     transformers.modeling_utils.PreTrainedModel._end = end
@@ -161,13 +163,11 @@ for start, end in windows:
     qeff_model = QEFFAutoModelForCausalLM.from_pretrained(model_id, config=config, torch_dtype=torch.float16)
     if hasattr(qeff_model, "model"):
         _null_outside_window_layers(qeff_model.model)
-    
-    # import pdb; pdb.set_trace()
-
 
     # Following command errors out by default, the user is supposed to run the printed command and provide the generated qpc path as prefill_qpc_path commenting out lines 55-68
 
     # prefill_qpc_path = ""
+    ################################# prefill
 
     onnx_path = qeff_model.compile(
         prefill_seq_len=PREFILL_SEQ_LEN,
@@ -184,6 +184,22 @@ for start, end in windows:
         enable_chunking=True,
         use_onnx_subfunctions=True,
     )
+
+    ################################# decode 
+    # onnx_path = qeff_model.compile(
+    #     prefill_seq_len=PREFILL_SEQ_LEN,
+    #     ctx_len=CTX_LEN,
+    #     num_cores=16,
+    #     mxfp6_matmul=True,
+    #     mxint8_kv_cache=True,
+    #     num_devices=1,
+    #     split_retained_state_io=True,
+    #     mos=1,
+    #     aic_enable_depth_first=True,
+    #     num_speculative_tokens=None,
+    #     prefill_only=False,
+    #     use_onnx_subfunctions=True,
+    # )
     if first_onnx_path is None:
         first_onnx_path = Path(onnx_path)
 
@@ -192,6 +208,8 @@ if first_onnx_path is None:
 export_root = _resolve_export_root(first_onnx_path)
 final_onnx_path = QEfficient.utils.layerwise_pipeline(str(export_root))
 
+export_end = time.perf_counter()
+print(f">>>>>>>> Export  time : {export_end - export_start:.2f} secs ")
 # if qeff_model is None:
 #     raise RuntimeError("Failed to initialize QEfficient model.")
 

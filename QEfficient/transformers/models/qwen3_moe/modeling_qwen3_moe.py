@@ -176,7 +176,7 @@ def _cumsum_scatter_gather_update_expert_blocked(
         else:
             packed_stop = packed_start + packed_chunk_size
         chunk_matched_idx = matched_idx[:, packed_start:packed_stop]
-        print(f"chunk_idx {chunk_idx}; packed_start {packed_start}, packed_stop {packed_stop}")
+        # print(f"chunk_idx {chunk_idx}; packed_start {packed_start}, packed_stop {packed_stop}")
 
         x_chunk = CtxGatherFunc3DGeneralized.apply(x_expanded, chunk_matched_idx)
 
@@ -207,17 +207,23 @@ def _cumsum_scatter_gather_update_expert_blocked(
 
 class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
     def __qeff_init__(self):
-        self.gate_proj_w = []
-        self.up_proj_w = []
-        self.down_proj_w = []
+        gate_proj_w = []
+        up_proj_w = []
+        down_proj_w = []
         with torch.no_grad():
             for e in range(self.num_experts):
-                self.gate_proj_w.append(self.experts[e].gate_proj.weight.T)
-                self.up_proj_w.append(self.experts[e].up_proj.weight.T)
-                self.down_proj_w.append(self.experts[e].down_proj.weight.T)
-            self.gate_proj_w = torch.stack(self.gate_proj_w)  # [E, H, I]
-            self.up_proj_w = torch.stack(self.up_proj_w)  # [E, H, I]
-            self.down_proj_w = torch.stack(self.down_proj_w)  # [E, I, H]
+                gate_proj_w.append(self.experts[e].gate_proj.weight.T)
+                up_proj_w.append(self.experts[e].up_proj.weight.T)
+                down_proj_w.append(self.experts[e].down_proj.weight.T)
+
+            for buffer_name, buffer_value in (
+                ("gate_proj_w", torch.stack(gate_proj_w)),  # [E, H, I]
+                ("up_proj_w", torch.stack(up_proj_w)),  # [E, H, I]
+                ("down_proj_w", torch.stack(down_proj_w)),  # [E, I, H]
+            ):
+                if hasattr(self, buffer_name):
+                    delattr(self, buffer_name)
+                setattr(self, buffer_name, nn.Parameter(buffer_value, requires_grad=False))
 
     def _forward_expert_blocked(self, x: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
         T, H = x.shape
@@ -248,40 +254,6 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
                 packed_chunk_size=EXPERT_BLOCKING_PACKED_CHUNK_SIZE,
             )
         return torch.einsum("ijk->jk", expert_out)
-
-    def _forward_expert_blocked_export_safe(self, x: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
-        """ONNX-export-safe blocked path that avoids tracing mega all-expert stacked constants."""
-        T, H = x.shape
-        num_nsp = EXPERT_BLOCKING_NUM_NSP
-        if self.num_experts % num_nsp != 0:
-            raise ValueError(
-                f"num_experts ({self.num_experts}) must be divisible by EXPERT_BLOCKING_NUM_NSP ({num_nsp})"
-            )
-        local_experts = self.num_experts // num_nsp
-        rw = routing_weights.transpose(0, 1).contiguous().view(local_experts, num_nsp, T).transpose(0, 1).contiguous()
-        expert_out = x.new_zeros((num_nsp, T, H))
-        for slot in range(local_experts):
-            print(f">>>>> slot {slot}")
-            slot_start = slot * num_nsp
-            slot_experts = self.experts[slot_start : slot_start + num_nsp]
-            W_g = torch.stack([expert.gate_proj.weight.T for expert in slot_experts], dim=0)
-            W_u = torch.stack([expert.up_proj.weight.T for expert in slot_experts], dim=0)
-            W_d = torch.stack([expert.down_proj.weight.T for expert in slot_experts], dim=0)
-            routing_weight = rw[:, slot, :]
-            T2Ei = routing_weight > 0
-            expert_out = _cumsum_scatter_gather_update_expert_blocked(
-                x=x,
-                T2Ei=T2Ei,
-                W_g=W_g,
-                W_u=W_u,
-                W_d=W_d,
-                routing_weight=routing_weight,
-                expert_out=expert_out,
-                act_fn=self.experts[0].act_fn,
-                T=T,
-                packed_chunk_size=EXPERT_BLOCKING_PACKED_CHUNK_SIZE,
-            )
-        return expert_out.sum(dim=0)
 
     def orig_forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, S, H = hidden_states.shape
@@ -321,7 +293,7 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         routing_weights.scatter_(1, top_i, top_w)
 
         if self.num_experts % EXPERT_BLOCKING_NUM_NSP == 0:
-            expert_out = self._forward_expert_blocked_export_safe(x=x, routing_weights=routing_weights) # self._forward_expert_blocked
+            expert_out = self._forward_expert_blocked(x=x, routing_weights=routing_weights) # self._forward_expert_blocked
             return expert_out.view(B, S, H), router_logits
 
         expert_out = x.new_zeros((T, H))
@@ -338,17 +310,23 @@ class QEffPrefillChunkedQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
 
 class QEffQwen3MoeSparseMoeBlock(Qwen3MoeSparseMoeBlock):
     def __qeff_init__(self):
-        self.gate_proj_w = []
-        self.up_proj_w = []
-        self.down_proj_w = []
+        gate_proj_w = []
+        up_proj_w = []
+        down_proj_w = []
         with torch.no_grad():
             for e in range(self.num_experts):
-                self.gate_proj_w.append(self.experts[e].gate_proj.weight.T)
-                self.up_proj_w.append(self.experts[e].up_proj.weight.T)
-                self.down_proj_w.append(self.experts[e].down_proj.weight.T)
-            self.gate_proj_w = torch.stack(self.gate_proj_w)
-            self.up_proj_w = torch.stack(self.up_proj_w)
-            self.down_proj_w = torch.stack(self.down_proj_w)
+                gate_proj_w.append(self.experts[e].gate_proj.weight.T)
+                up_proj_w.append(self.experts[e].up_proj.weight.T)
+                down_proj_w.append(self.experts[e].down_proj.weight.T)
+
+            for buffer_name, buffer_value in (
+                ("gate_proj_w", torch.stack(gate_proj_w)),
+                ("up_proj_w", torch.stack(up_proj_w)),
+                ("down_proj_w", torch.stack(down_proj_w)),
+            ):
+                if hasattr(self, buffer_name):
+                    delattr(self, buffer_name)
+                setattr(self, buffer_name, nn.Parameter(buffer_value, requires_grad=False))
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, S, H = hidden_states.shape
@@ -564,7 +542,7 @@ class QEffQwen3MoeModel(Qwen3MoeModel):
         cos = self.cos_cached[position_ids].unsqueeze(1)
 
         for layer_idx, decoder_layer in enumerate(self.layers):
-            print(f">>>>>>>>>>>>>>> layer_idx : {layer_idx}")
+            # print(f">>>>>>>>>>>>>>> layer_idx : {layer_idx}")
             if layer_idx < start or layer_idx >= end:
                 continue
             if layer_indices_to_run is not None and layer_idx not in layer_indices_to_run:
